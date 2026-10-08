@@ -1,0 +1,526 @@
+{
+  "id": "wfB_matching",
+  "name": "B - User-Loan Matching",
+  "nodes": [
+    {
+      "id": "9b6e49d2-2dd5-5eaa-a259-4522595edc64",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "match-users",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "webhookId": "match-users-wh"
+    },
+    {
+      "id": "2dd08d75-9811-5bdb-bc63-ab503bbefaaf",
+      "name": "Verify Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Verify the HMAC-SHA256 signature the ingest Lambda puts on the webhook:\n//   X-Signature: sha256=HMAC(WEBHOOK_SECRET, \"<X-Timestamp>.<raw body>\")\n// and reject anything older than 5 minutes (replay protection).\nconst crypto = require('crypto');\nconst headers = $input.first().json.headers || {};\nconst raw = await this.helpers.getBinaryDataBuffer(0, 'data');\nconst ts = headers['x-timestamp'];\nconst sig = String(headers['x-signature'] || '').replace(/^sha256=/, '');\nconst expected = crypto.createHmac('sha256', $env.WEBHOOK_SECRET || '').update(`${ts}.`).update(raw).digest('hex');\n\nlet valid = Boolean($env.WEBHOOK_SECRET) && Boolean(ts) && sig.length === expected.length\n  && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))\n  && Math.abs(Date.now() / 1000 - Number(ts)) <= 300;\n\nlet uploadJobId = null;\nif (valid) {\n  try { uploadJobId = JSON.parse(raw.toString('utf8')).upload_job_id; } catch (e) { valid = false; }\n  valid = valid && /^[0-9a-f-]{36}$/.test(uploadJobId || '');\n}\nreturn [{ json: { valid, upload_job_id: uploadJobId } }];\n",
+        "mode": "runOnceForAllItems"
+      }
+    },
+    {
+      "id": "67e9a6ab-ea97-54df-a85b-4ea359957163",
+      "name": "Signature Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "valid",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "9436778d-c404-5a1e-8dc6-a9c2a54fe0c9",
+      "name": "Respond 202",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"accepted\": true, \"upload_job_id\": $json.upload_job_id } }}",
+        "options": {
+          "responseCode": 202
+        }
+      }
+    },
+    {
+      "id": "dcbf4316-cf0d-5470-b90d-e862f6773bb5",
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1200,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"error\": \"invalid signature\" } }}",
+        "options": {
+          "responseCode": 401
+        }
+      }
+    },
+    {
+      "id": "f2e0e275-e0d3-5ecf-82db-b3173aaf95d1",
+      "name": "Start Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1440,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH job AS (\n  UPDATE upload_jobs SET matching_status = 'RUNNING', matching_execution_id = $2, updated_at = now()\n  WHERE id = $1::uuid AND status IN ('COMPLETED', 'COMPLETED_WITH_ERRORS') RETURNING id\n), cleared AS (   -- a re-run replaces matches that were not emailed yet\n  DELETE FROM matches WHERE upload_job_id = $1::uuid AND notified_at IS NULL AND EXISTS (SELECT 1 FROM job)\n), cnt AS (\n  SELECT count(*) AS users FROM users WHERE upload_job_id = $1::uuid\n), m AS (\n  INSERT INTO funnel_metrics (upload_job_id, users_count)\n  SELECT job.id, cnt.users FROM job, cnt\n  ON CONFLICT (upload_job_id) DO UPDATE SET users_count = EXCLUDED.users_count, products_count = 0,\n    pairs_naive = 0, pairs_after_sql = 0, matches_rules = 0, llm_products = 0, llm_calls = 0,\n    started_at = now(), finished_at = NULL\n)\nSELECT (SELECT count(*) FROM job) AS job_found, (SELECT users FROM cnt) AS users_count",
+        "options": {
+          "queryReplacement": "={{ [$('Verify Signature').first().json.upload_job_id, String($execution.id)] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgcred",
+          "name": "Loans Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "17984ed4-fe27-5029-8a4d-f440496ad13d",
+      "name": "Find Uncached Criteria",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1680,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT p.id AS product_id, p.product_name, p.criteria_text, md5(p.criteria_text) AS cache_key\nFROM loan_products p\nLEFT JOIN llm_cache c ON c.cache_key = md5(p.criteria_text)\nWHERE p.active AND p.needs_review AND p.criteria_text IS NOT NULL AND c.cache_key IS NULL",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgcred",
+          "name": "Loans Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "183efa94-a91f-541f-aacd-c95f1e9079e2",
+      "name": "LLM Normalise Criteria",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Stage 3: the LLM is used ONLY to turn free-text eligibility wording into structured thresholds,\n// once per distinct wording (results cached in llm_cache). It is never called per user or per pair.\n// ---- shared LLM helper (inlined into Code nodes by build_workflows.py) ----\n// LLM_PROVIDER=gemini (hosted, rate-limited free tier) | ollama (local open model, unlimited, no key)\nconst LLM_PROVIDER = String($env.LLM_PROVIDER || 'gemini').toLowerCase();\nfunction llmConfigError() {\n  if (LLM_PROVIDER === 'gemini' && !$env.GEMINI_API_KEY) return 'LLM_PROVIDER=gemini but GEMINI_API_KEY is not set';\n  if (LLM_PROVIDER !== 'gemini' && LLM_PROVIDER !== 'ollama') return `unknown LLM_PROVIDER \"${LLM_PROVIDER}\"`;\n  return null;\n}\n// Returns the model's answer parsed as JSON. Retries transient failures with backoff.\nasync function callLLM(ctx, prompt) {\n  let lastError;\n  for (let attempt = 1; attempt <= 3; attempt++) {\n    try {\n      let text;\n      if (LLM_PROVIDER === 'ollama') {\n        const resp = await ctx.helpers.httpRequest({\n          method: 'POST', url: `${$env.OLLAMA_URL || 'http://ollama:11434'}/api/chat`, json: true, timeout: 300000,\n          body: { model: $env.OLLAMA_MODEL || 'qwen2.5:3b', stream: false, format: 'json',\n                  options: { temperature: 0 }, messages: [{ role: 'user', content: prompt }] },\n        });\n        text = resp.message.content;\n      } else {\n        const model = $env.GEMINI_MODEL || 'gemini-3.5-flash-lite';\n        const resp = await ctx.helpers.httpRequest({\n          method: 'POST', json: true, timeout: 90000,\n          url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,\n          headers: { 'x-goog-api-key': $env.GEMINI_API_KEY, 'Content-Type': 'application/json' },\n          body: { contents: [{ parts: [{ text: prompt }] }],\n                  generationConfig: { responseMimeType: 'application/json', temperature: 0 } },\n        });\n        text = resp.candidates[0].content.parts.find((p) => typeof p.text === 'string').text;\n      }\n      return JSON.parse(text);\n    } catch (e) {\n      lastError = e;\n      if (attempt < 3) await new Promise((r) => setTimeout(r, 2000 * attempt));\n    }\n  }\n  throw lastError;\n}\n// ---- end shared helper ----\n\nconst EMPLOYMENT = ['Salaried', 'Self-Employed', 'Business'];\n\nconst todo = [];\nconst seen = new Set();\nfor (const item of $input.all()) {\n  const r = item.json;\n  if (!r.cache_key || seen.has(r.cache_key)) continue;\n  seen.add(r.cache_key);\n  todo.push(r);\n}\n\nconst num = (v) => (typeof v === 'number' && isFinite(v) && v >= 0 ? v : null);\nconst rows = [];\nconst errors = [];\nlet calls = 0;\n\nconst configError = llmConfigError();\nif (todo.length && configError) {\n  errors.push(`${configError}: ${todo.length} product(s) with free-text criteria were skipped`);\n} else {\n  for (const r of todo) {\n    const prompt =\n      'Extract loan eligibility thresholds from the text below. Respond with a single JSON object using exactly these keys: ' +\n      'min_income (minimum MONTHLY income as a number, convert yearly figures to monthly), min_credit_score, ' +\n      'max_credit_score, min_age, max_age, allowed_employment (array containing any of \"Salaried\", ' +\n      '\"Self-Employed\", \"Business\"; null if not restricted). Use null for anything not stated. ' +\n      'Do not guess.\\n\\nTEXT:\\n' + r.criteria_text;\n    let parsed;\n    try {\n      calls++;\n      parsed = await callLLM(this, prompt);\n    } catch (e) {\n      errors.push(`${r.product_name}: ${e.message}`);\n      continue;\n    }\n    // Sanity-check before caching: a wrong extraction would silently mis-match thousands of users.\n    const t = { min_income: num(parsed.min_income), min_credit_score: num(parsed.min_credit_score),\n                max_credit_score: num(parsed.max_credit_score), min_age: num(parsed.min_age), max_age: num(parsed.max_age) };\n    const implausible =\n      (t.min_income != null && (t.min_income < 1000 || t.min_income > 10000000)) ||\n      [t.min_credit_score, t.max_credit_score].some((v) => v != null && (v < 300 || v > 900)) ||\n      [t.min_age, t.max_age].some((v) => v != null && (v < 18 || v > 100)) ||\n      (t.min_credit_score != null && t.max_credit_score != null && t.min_credit_score > t.max_credit_score) ||\n      (t.min_age != null && t.max_age != null && t.min_age > t.max_age);\n    if (implausible) {\n      errors.push(`${r.product_name}: implausible extraction ${JSON.stringify(t)} (not cached)`);\n      continue;\n    }\n    const allowed = Array.isArray(parsed.allowed_employment)\n      ? parsed.allowed_employment.filter((e) => EMPLOYMENT.includes(e)) : [];\n    rows.push({\n      cache_key: r.cache_key,\n      result: {\n        min_income: num(parsed.min_income), min_credit_score: num(parsed.min_credit_score),\n        max_credit_score: num(parsed.max_credit_score), min_age: num(parsed.min_age),\n        max_age: num(parsed.max_age), allowed_employment: allowed.length ? allowed : null,\n      },\n    });\n  }\n}\nconst uploadJobId = $('Verify Signature').first().json.upload_job_id;\nreturn [{ json: { upload_job_id: uploadJobId, rows, llm_calls: calls, errors } }];\n",
+        "mode": "runOnceForAllItems"
+      }
+    },
+    {
+      "id": "6fbf47f9-0f7f-51e0-86c1-78f1f82501e3",
+      "name": "Save LLM Cache",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2160,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n  INSERT INTO llm_cache (cache_key, result)\n  SELECT r.cache_key, r.result FROM jsonb_to_recordset($2::jsonb) AS r(cache_key text, result jsonb)\n  ON CONFLICT (cache_key) DO NOTHING RETURNING 1\n)\nUPDATE funnel_metrics f SET llm_calls = $3::int,\n  llm_products = (SELECT count(*) FROM loan_products WHERE active AND needs_review)\nWHERE f.upload_job_id = $1::uuid\nRETURNING f.upload_job_id",
+        "options": {
+          "queryReplacement": "={{ [$json.upload_job_id, JSON.stringify($json.rows), $json.llm_calls] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgcred",
+          "name": "Loans Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "8b605dc7-2af1-5939-999f-8cb64b7ff0ff",
+      "name": "Plan Batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Stage 0: work only on the users of THIS upload, in fixed-size batches.\n// The scoring weights and TOP_K live here (in n8n) and are passed to the SQL stage as parameters.\nconst BATCH_SIZE = 1000;\nconst CONFIG = { w_income: 0.35, w_credit: 0.25, w_rate: 0.4, top_k: 5 };\nconst { upload_job_id } = $('Verify Signature').first().json;\nconst start = $('Start Run').first().json;\nif (!Number(start.job_found)) {\n  throw new Error(`Upload job ${upload_job_id} is not in a COMPLETED state; nothing to match`);\n}\nconst batches = Math.max(1, Math.ceil(Number(start.users_count) / BATCH_SIZE));\nreturn Array.from({ length: batches }, (_, i) => ({\n  json: { upload_job_id, offset: i * BATCH_SIZE, batch_size: BATCH_SIZE, ...CONFIG },\n}));\n",
+        "mode": "runOnceForAllItems"
+      }
+    },
+    {
+      "id": "7b22310c-25b5-5037-8c39-2656a8fe8ceb",
+      "name": "Loop Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2640,
+        300
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "6edfc263-d4ce-5966-bea1-49f59660fd7c",
+      "name": "SQL Pre-filter + Top-K",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2880,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH batch AS (\n  SELECT user_id, monthly_income, credit_score, age, employment_status\n  FROM users WHERE upload_job_id = $1::uuid ORDER BY user_id LIMIT $3::int OFFSET $2::int\n), fit AS (   -- stage 1: hard criteria (set-based join) + how comfortably each pair clears them\n  SELECT b.user_id, p.id AS product_id, p.via_llm,\n         COALESCE(LEAST(GREATEST((b.monthly_income - p.min_income) / NULLIF(p.min_income, 0), 0), 1), 0.5) AS income_fit,\n         COALESCE(LEAST(GREATEST((b.credit_score - p.min_credit_score) / 100.0, 0), 1), 0.5)              AS credit_fit,\n         COALESCE(LEAST(GREATEST((20 - p.interest_rate) / 10.0, 0), 1), 0.5)                              AS rate_fit\n  FROM batch b\n  JOIN product_criteria p\n    ON b.monthly_income >= COALESCE(p.min_income, 0)\n   AND b.credit_score  >= COALESCE(p.min_credit_score, 0)\n   AND b.credit_score  <= COALESCE(p.max_credit_score, 1000)\n   AND b.age           >= COALESCE(p.min_age, 0)\n   AND b.age           <= COALESCE(p.max_age, 200)\n   AND (p.allowed_employment IS NULL OR b.employment_status = ANY (p.allowed_employment))\n), ranked AS (   -- stage 2: weights come from n8n; keep only the top K products per user, inside Postgres\n  SELECT f.*,\n         round((100 * ($4::numeric * income_fit + $5::numeric * credit_fit + $6::numeric * rate_fit))::numeric, 2) AS score,\n         row_number() OVER (PARTITION BY user_id\n                            ORDER BY $4::numeric * income_fit + $5::numeric * credit_fit + $6::numeric * rate_fit DESC,\n                                     product_id) AS rn,\n         count(*) OVER () AS eligible_total\n  FROM fit f\n)\nSELECT user_id, product_id, via_llm, score, income_fit, credit_fit, rate_fit, eligible_total\nFROM ranked WHERE rn <= $7::int",
+        "options": {
+          "queryReplacement": "={{ [$json.upload_job_id, $json.offset, $json.batch_size, $json.w_income, $json.w_credit, $json.w_rate, $json.top_k] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgcred",
+          "name": "Loans Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "b079c8f5-ce0f-5c0a-9fdc-1209a9a8c9cc",
+      "name": "Format Matches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Stage 2 result: Postgres already applied the hard criteria, scored each pair with the weights from\n// \"Plan Batches\" and kept the top-K products per user, so only those rows reach n8n.\n// Here we just shape them for the bulk insert and report how many pairs survived stage 1.\nconst uploadJobId = $('Verify Signature').first().json.upload_job_id;\nconst rows = $input.all().map((i) => i.json).filter((r) => r.product_id != null); // drop the empty-batch placeholder\nreturn [{\n  json: {\n    upload_job_id: uploadJobId,\n    pairs_after_sql: rows.length ? Number(rows[0].eligible_total) : 0,\n    rows: rows.map((r) => ({\n      user_id: r.user_id,\n      product_id: Number(r.product_id),\n      score: Number(r.score),\n      match_stage: r.via_llm ? 'rules_llm' : 'rules',\n      reasons: { income_fit: +Number(r.income_fit).toFixed(2), credit_fit: +Number(r.credit_fit).toFixed(2),\n                 rate_fit: +Number(r.rate_fit).toFixed(2) },\n    })),\n  },\n}];\n",
+        "mode": "runOnceForAllItems"
+      }
+    },
+    {
+      "id": "023eaf03-187b-597b-84e3-41c748c2fca2",
+      "name": "Insert Matches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3360,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n  INSERT INTO matches (upload_job_id, user_id, product_id, score, match_stage, reasons)\n  SELECT $1::uuid, r.user_id, r.product_id, r.score, r.match_stage, r.reasons\n  FROM jsonb_to_recordset($2::jsonb)\n       AS r(user_id text, product_id bigint, score numeric, match_stage text, reasons jsonb)\n  ON CONFLICT (upload_job_id, user_id, product_id) DO NOTHING RETURNING 1\n)\nUPDATE funnel_metrics SET pairs_after_sql = pairs_after_sql + $3::bigint,\n       matches_rules = matches_rules + (SELECT count(*) FROM ins)\nWHERE upload_job_id = $1::uuid\nRETURNING upload_job_id",
+        "options": {
+          "queryReplacement": "={{ [$json.upload_job_id, JSON.stringify($json.rows), $json.pairs_after_sql] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgcred",
+          "name": "Loans Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "4a47dc1d-dd72-5e95-ab4c-c44eb2a8b8f4",
+      "name": "Finalize",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3600,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH j AS (UPDATE upload_jobs SET matching_status = 'DONE', updated_at = now()\n           WHERE id = $1::uuid RETURNING id)\nUPDATE funnel_metrics SET finished_at = now(),\n  products_count = (SELECT count(*) FROM product_criteria),\n  pairs_naive = users_count::bigint * (SELECT count(*) FROM product_criteria)\nWHERE upload_job_id = $1::uuid\nRETURNING upload_job_id, users_count, products_count, pairs_naive, pairs_after_sql, matches_rules, llm_calls",
+        "options": {
+          "queryReplacement": "={{ [$('Verify Signature').first().json.upload_job_id] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgcred",
+          "name": "Loans Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "executeOnce": true
+    },
+    {
+      "id": "cf8bdaed-3456-5ba6-9219-47ac59bdbf63",
+      "name": "Trigger Notifications",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3840,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5678/webhook/notify-users",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Internal-Token",
+              "value": "={{ $env.WEBHOOK_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ upload_job_id: $json.upload_job_id }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Signature": {
+      "main": [
+        [
+          {
+            "node": "Signature Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Signature Valid?": {
+      "main": [
+        [
+          {
+            "node": "Respond 202",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 401",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond 202": {
+      "main": [
+        [
+          {
+            "node": "Start Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start Run": {
+      "main": [
+        [
+          {
+            "node": "Find Uncached Criteria",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Uncached Criteria": {
+      "main": [
+        [
+          {
+            "node": "LLM Normalise Criteria",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Normalise Criteria": {
+      "main": [
+        [
+          {
+            "node": "Save LLM Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save LLM Cache": {
+      "main": [
+        [
+          {
+            "node": "Plan Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan Batches": {
+      "main": [
+        [
+          {
+            "node": "Loop Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Batches": {
+      "main": [
+        [
+          {
+            "node": "Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "SQL Pre-filter + Top-K",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SQL Pre-filter + Top-K": {
+      "main": [
+        [
+          {
+            "node": "Format Matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Matches": {
+      "main": [
+        [
+          {
+            "node": "Insert Matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Matches": {
+      "main": [
+        [
+          {
+            "node": "Loop Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize": {
+      "main": [
+        [
+          {
+            "node": "Trigger Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "wfE_error"
+  },
+  "pinData": {}
+}

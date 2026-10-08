@@ -1,0 +1,303 @@
+{
+  "id": "wfA_discovery",
+  "name": "A - Loan Product Discovery",
+  "nodes": [
+    {
+      "id": "70857f76-aa5c-5fe7-be1a-c144d50957e6",
+      "name": "Daily 02:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 2
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "fb2e8884-ce2e-5629-aa3a-d08b3e9ff83b",
+      "name": "Run Now (manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "53a916b9-a19b-5a28-97f1-783972c6ea32",
+      "name": "Load Crawl State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT source, content_hash FROM crawl_state",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgcred",
+          "name": "Loans Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "1ce5f0c6-18ef-5fb5-a352-6163ef37d01c",
+      "name": "Sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// List of public pages to crawl (edit freely) + crawl state from the previous run.\n// ---- shared LLM helper (inlined into Code nodes by build_workflows.py) ----\n// LLM_PROVIDER=gemini (hosted, rate-limited free tier) | ollama (local open model, unlimited, no key)\nconst LLM_PROVIDER = String($env.LLM_PROVIDER || 'gemini').toLowerCase();\nfunction llmConfigError() {\n  if (LLM_PROVIDER === 'gemini' && !$env.GEMINI_API_KEY) return 'LLM_PROVIDER=gemini but GEMINI_API_KEY is not set';\n  if (LLM_PROVIDER !== 'gemini' && LLM_PROVIDER !== 'ollama') return `unknown LLM_PROVIDER \"${LLM_PROVIDER}\"`;\n  return null;\n}\n// Returns the model's answer parsed as JSON. Retries transient failures with backoff.\nasync function callLLM(ctx, prompt) {\n  let lastError;\n  for (let attempt = 1; attempt <= 3; attempt++) {\n    try {\n      let text;\n      if (LLM_PROVIDER === 'ollama') {\n        const resp = await ctx.helpers.httpRequest({\n          method: 'POST', url: `${$env.OLLAMA_URL || 'http://ollama:11434'}/api/chat`, json: true, timeout: 300000,\n          body: { model: $env.OLLAMA_MODEL || 'qwen2.5:3b', stream: false, format: 'json',\n                  options: { temperature: 0 }, messages: [{ role: 'user', content: prompt }] },\n        });\n        text = resp.message.content;\n      } else {\n        const model = $env.GEMINI_MODEL || 'gemini-3.5-flash-lite';\n        const resp = await ctx.helpers.httpRequest({\n          method: 'POST', json: true, timeout: 90000,\n          url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,\n          headers: { 'x-goog-api-key': $env.GEMINI_API_KEY, 'Content-Type': 'application/json' },\n          body: { contents: [{ parts: [{ text: prompt }] }],\n                  generationConfig: { responseMimeType: 'application/json', temperature: 0 } },\n        });\n        text = resp.candidates[0].content.parts.find((p) => typeof p.text === 'string').text;\n      }\n      return JSON.parse(text);\n    } catch (e) {\n      lastError = e;\n      if (attempt < 3) await new Promise((r) => setTimeout(r, 2000 * attempt));\n    }\n  }\n  throw lastError;\n}\n// ---- end shared helper ----\n\nif (llmConfigError()) {\n  throw new Error(`${llmConfigError()}. The crawler needs an LLM to extract products; seeded products stay active.`);\n}\nconst state = {};\nfor (const r of $('Load Crawl State').all()) if (r.json.source) state[r.json.source] = r.json.content_hash;\nconst SOURCES = [\n  { source: 'bankbazaar', url: 'https://www.bankbazaar.com/personal-loan.html' },\n  { source: 'hdfcbank', url: 'https://www.hdfcbank.com/personal/borrow/popular-loans/personal-loan' },\n];\nreturn SOURCES.map((s) => ({ json: { ...s, previous_hash: state[s.source] || null } }));\n",
+        "mode": "runOnceForAllItems"
+      }
+    },
+    {
+      "id": "95e88199-8dfe-5ae0-8223-7cf60c7f83ef",
+      "name": "Fetch Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        300
+      ],
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (compatible; LoanEligibilityBot/1.0)"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "15d09992-f4af-5a9a-8c77-42f491a56152",
+      "name": "Extract Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Strip a fetched page down to readable text, hash it, and flag whether it changed since last crawl.\nconst crypto = require('crypto');\nconst MAX_CHARS = 60000;\nconst sources = $('Sources').all();\nreturn $input.all().map((item, i) => {\n  const meta = sources[i].json;\n  const html = typeof item.json.data === 'string' ? item.json.data : '';\n  if (item.json.error || !html) {\n    return { json: { source: meta.source, ok: false, changed: false, reason: String(item.json.error?.message || item.json.error || 'empty response') } };\n  }\n  const text = html\n    .replace(/<(script|style|noscript|svg)[\\s\\S]*?<\\/\\1>/gi, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')\n    .replace(/\\s+/g, ' ').trim().slice(0, MAX_CHARS);\n  const hash = crypto.createHash('sha256').update(text).digest('hex');\n  return { json: { source: meta.source, url: meta.url, ok: text.length > 500, changed: hash !== meta.previous_hash, content_hash: hash, text } };\n});\n",
+        "mode": "runOnceForAllItems"
+      }
+    },
+    {
+      "id": "a29fb865-43c7-56b5-a16a-83a5d6790ef0",
+      "name": "Changed & Readable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1680,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ok",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "ch",
+              "leftValue": "={{ $json.changed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "c874b1c1-d4e2-5fcb-b85a-0fa969ecb028",
+      "name": "LLM Extract Products",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Ask the LLM to extract products from the page text, then validate before anything is written.\n// ---- shared LLM helper (inlined into Code nodes by build_workflows.py) ----\n// LLM_PROVIDER=gemini (hosted, rate-limited free tier) | ollama (local open model, unlimited, no key)\nconst LLM_PROVIDER = String($env.LLM_PROVIDER || 'gemini').toLowerCase();\nfunction llmConfigError() {\n  if (LLM_PROVIDER === 'gemini' && !$env.GEMINI_API_KEY) return 'LLM_PROVIDER=gemini but GEMINI_API_KEY is not set';\n  if (LLM_PROVIDER !== 'gemini' && LLM_PROVIDER !== 'ollama') return `unknown LLM_PROVIDER \"${LLM_PROVIDER}\"`;\n  return null;\n}\n// Returns the model's answer parsed as JSON. Retries transient failures with backoff.\nasync function callLLM(ctx, prompt) {\n  let lastError;\n  for (let attempt = 1; attempt <= 3; attempt++) {\n    try {\n      let text;\n      if (LLM_PROVIDER === 'ollama') {\n        const resp = await ctx.helpers.httpRequest({\n          method: 'POST', url: `${$env.OLLAMA_URL || 'http://ollama:11434'}/api/chat`, json: true, timeout: 300000,\n          body: { model: $env.OLLAMA_MODEL || 'qwen2.5:3b', stream: false, format: 'json',\n                  options: { temperature: 0 }, messages: [{ role: 'user', content: prompt }] },\n        });\n        text = resp.message.content;\n      } else {\n        const model = $env.GEMINI_MODEL || 'gemini-3.5-flash-lite';\n        const resp = await ctx.helpers.httpRequest({\n          method: 'POST', json: true, timeout: 90000,\n          url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,\n          headers: { 'x-goog-api-key': $env.GEMINI_API_KEY, 'Content-Type': 'application/json' },\n          body: { contents: [{ parts: [{ text: prompt }] }],\n                  generationConfig: { responseMimeType: 'application/json', temperature: 0 } },\n        });\n        text = resp.candidates[0].content.parts.find((p) => typeof p.text === 'string').text;\n      }\n      return JSON.parse(text);\n    } catch (e) {\n      lastError = e;\n      if (attempt < 3) await new Promise((r) => setTimeout(r, 2000 * attempt));\n    }\n  }\n  throw lastError;\n}\n// ---- end shared helper ----\n\nconst EMPLOYMENT = ['Salaried', 'Self-Employed', 'Business'];\nconst num = (v) => (typeof v === 'number' && isFinite(v) && v >= 0 ? v : null);\nconst PROMPT =\n  'You extract personal loan products from a lender web page. Respond with a single JSON object ' +\n  '{\"products\": [...]}. Each product: {product_name, interest_rate (lowest annual % as a number or null), ' +\n  'min_income (minimum MONTHLY income as a number or null), min_credit_score, max_credit_score, min_age, max_age, ' +\n  'allowed_employment (array of \"Salaried\", \"Self-Employed\", \"Business\" or null), criteria_text (the page\\'s ' +\n  'eligibility wording for this product, verbatim, or null)}. Only include personal loan products actually ' +\n  'described on the page. Use null for anything not stated. Do not invent values.\\n\\nPAGE TEXT:\\n';\n\nconst meta = $json;\nlet raw = [];\nlet error = null;\ntry {\n  const parsed = await callLLM(this, PROMPT + meta.text);\n  raw = Array.isArray(parsed) ? parsed : (parsed.products || []);\n} catch (e) {\n  error = e.message; // nothing is written and the hash is not stored, so the next run retries\n}\n\nconst products = [];\nfor (const p of raw) {\n  if (!p || typeof p.product_name !== 'string' || !p.product_name.trim()) continue;\n  const allowed = Array.isArray(p.allowed_employment) ? p.allowed_employment.filter((e) => EMPLOYMENT.includes(e)) : [];\n  const row = {\n    product_name: p.product_name.trim().slice(0, 200),\n    interest_rate: num(p.interest_rate),\n    min_income: num(p.min_income), min_credit_score: num(p.min_credit_score), max_credit_score: num(p.max_credit_score),\n    min_age: num(p.min_age), max_age: num(p.max_age),\n    allowed_employment: allowed.length ? allowed : null,\n    criteria_text: typeof p.criteria_text === 'string' && p.criteria_text.trim() ? p.criteria_text.trim().slice(0, 2000) : null,\n  };\n  if (row.min_income == null && row.min_credit_score == null && !row.criteria_text) continue; // no criteria at all\n  products.push(row);\n}\nreturn { json: { source: meta.source, content_hash: meta.content_hash, products, error } };\n",
+        "mode": "runOnceForEachItem"
+      }
+    },
+    {
+      "id": "a48a214e-3517-59af-9f4c-3e846c7317e9",
+      "name": "Upsert Products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2160,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n  INSERT INTO loan_products (source, product_name, interest_rate, min_income, min_credit_score,\n      max_credit_score, min_age, max_age, allowed_employment, criteria_text, needs_review, active, last_seen_at)\n  SELECT $1, r.product_name, r.interest_rate, r.min_income, r.min_credit_score, r.max_credit_score,\n         r.min_age::int, r.max_age::int,\n         CASE WHEN jsonb_typeof(r.allowed_employment) = 'array'\n              THEN ARRAY(SELECT jsonb_array_elements_text(r.allowed_employment)) END,\n         r.criteria_text,\n         (r.min_income IS NULL AND r.min_credit_score IS NULL AND r.criteria_text IS NOT NULL),\n         true, now()\n  FROM jsonb_to_recordset($2::jsonb) AS r(product_name text, interest_rate numeric, min_income numeric,\n       min_credit_score int, max_credit_score int, min_age numeric, max_age numeric,\n       allowed_employment jsonb, criteria_text text)\n  ON CONFLICT (source, product_name) DO UPDATE SET\n    interest_rate = EXCLUDED.interest_rate, min_income = EXCLUDED.min_income,\n    min_credit_score = EXCLUDED.min_credit_score, max_credit_score = EXCLUDED.max_credit_score,\n    min_age = EXCLUDED.min_age, max_age = EXCLUDED.max_age, allowed_employment = EXCLUDED.allowed_employment,\n    criteria_text = EXCLUDED.criteria_text, needs_review = EXCLUDED.needs_review,\n    active = true, last_seen_at = now()\n  RETURNING 1\n), retired AS (   -- products that vanished from the page; only when this crawl found something\n  UPDATE loan_products SET active = false\n  WHERE source = $1 AND active AND last_seen_at < now() AND (SELECT count(*) FROM ins) > 0\n  RETURNING 1\n), state AS (     -- remember the page hash only after a successful extraction\n  INSERT INTO crawl_state (source, content_hash, last_crawled_at, last_status)\n  SELECT $1, $3, now(), 'ok' WHERE (SELECT count(*) FROM ins) > 0\n  ON CONFLICT (source) DO UPDATE SET content_hash = EXCLUDED.content_hash,\n    last_crawled_at = now(), last_status = 'ok'\n)\nSELECT $1 AS source, (SELECT count(*) FROM ins) AS upserted, (SELECT count(*) FROM retired) AS retired",
+        "options": {
+          "queryReplacement": "={{ [$json.source, JSON.stringify($json.products), $json.content_hash] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgcred",
+          "name": "Loans Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    }
+  ],
+  "connections": {
+    "Daily 02:00": {
+      "main": [
+        [
+          {
+            "node": "Load Crawl State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Now (manual)": {
+      "main": [
+        [
+          {
+            "node": "Load Crawl State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Crawl State": {
+      "main": [
+        [
+          {
+            "node": "Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sources": {
+      "main": [
+        [
+          {
+            "node": "Fetch Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Page": {
+      "main": [
+        [
+          {
+            "node": "Extract Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Text": {
+      "main": [
+        [
+          {
+            "node": "Changed & Readable?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Changed & Readable?": {
+      "main": [
+        [
+          {
+            "node": "LLM Extract Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Extract Products": {
+      "main": [
+        [
+          {
+            "node": "Upsert Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "wfE_error"
+  },
+  "pinData": {}
+}

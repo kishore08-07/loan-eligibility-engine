@@ -1,0 +1,476 @@
+{
+  "id": "wfC_notify",
+  "name": "C - User Notification",
+  "nodes": [
+    {
+      "id": "4d215f2f-ef2f-50cd-bcc8-bfe226feb415",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "notify-users",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "notify-users-wh"
+    },
+    {
+      "id": "a0b0edeb-c9fb-5494-970b-88a34c02832d",
+      "name": "Config & Safety Checks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Guard rails for notifications: authenticate the caller and refuse to email real CSV addresses\n// unless NOTIFY_LIVE=true. Normally every mail goes to an alias of TEST_RECIPIENT.\nconst headers = $input.first().json.headers || {};\nif (!$env.WEBHOOK_SECRET || headers['x-internal-token'] !== $env.WEBHOOK_SECRET) {\n  throw new Error('Unauthorised call to notify-users webhook');\n}\nconst jobId = ($input.first().json.body || {}).upload_job_id;\nif (!/^[0-9a-f-]{36}$/.test(jobId || '')) throw new Error('upload_job_id missing or invalid');\n\nconst live = $env.NOTIFY_LIVE === 'true';\nconst base = String($env.TEST_RECIPIENT || '').trim();\nif (!live && !/^[^@\\s+]+@[^@\\s]+$/.test(base)) {\n  throw new Error('Set TEST_RECIPIENT (e.g. abcd@gmail.com): refusing to email addresses from the CSV');\n}\nconst transport = String($env.EMAIL_TRANSPORT || 'smtp').toLowerCase();\nif (transport === 'ses' && !$env.SES_FROM) throw new Error('EMAIL_TRANSPORT=ses requires SES_FROM');\nconst max = parseInt($env.NOTIFY_MAX_EMAILS || '', 10);\nreturn [{ json: { upload_job_id: jobId, limit: Number.isFinite(max) && max > 0 ? max : 1000000, transport } }];\n",
+        "mode": "runOnceForAllItems"
+      }
+    },
+    {
+      "id": "7d61ac4a-6802-59d3-9c80-fbb3485c2bcb",
+      "name": "Fetch Pending Matches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH pending AS (\n  SELECT m.id AS match_id, m.product_id, m.score, u.email, u.name\n  FROM matches m JOIN users u ON u.user_id = m.user_id\n  WHERE m.upload_job_id = $1::uuid AND m.notified_at IS NULL\n), best AS (   -- one row per (recipient, product): users sharing an email are merged\n  SELECT DISTINCT ON (email, product_id) email, name, product_id, score\n  FROM pending ORDER BY email, product_id, score DESC\n), ids AS (\n  SELECT email, array_agg(match_id) AS match_ids FROM pending GROUP BY email\n)\nSELECT b.email, min(b.name) AS name, ids.match_ids,\n       jsonb_agg(jsonb_build_object('product_name', p.product_name, 'source', p.source,\n                 'interest_rate', p.interest_rate, 'min_income', p.min_income,\n                 'min_credit_score', p.min_credit_score) ORDER BY b.score DESC) AS products\nFROM best b\nJOIN product_criteria p ON p.id = b.product_id\nJOIN ids ON ids.email = b.email\nGROUP BY b.email, ids.match_ids\nORDER BY b.email\nLIMIT $2::int",
+        "options": {
+          "queryReplacement": "={{ [$json.upload_job_id, $json.limit] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgcred",
+          "name": "Loans Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "a7572450-3c24-5bc4-bade-7e8b383782ad",
+      "name": "Build Emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// One email per distinct recipient address. CSV values are untrusted: always HTML-escape them.\nconst esc = (s) => String(s ?? '').replace(/[&<>\"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\nconst live = $env.NOTIFY_LIVE === 'true';\nconst [baseLocal, baseDomain] = String($env.TEST_RECIPIENT || '').trim().split('@');\nconst from = $env.SES_FROM || 'loans@example.test';\nconst transport = String($env.EMAIL_TRANSPORT || 'smtp').toLowerCase();\n\nconst out = [];\nlet n = 0;\nfor (const item of $input.all()) {\n  const r = item.json;\n  if (!r.email) continue; // placeholder item from an empty result\n  n += 1;\n  const tag = String(n); // abcd+1, abcd+2, ... : a small, predictable set of aliases to verify in the SES sandbox\n  const to = live ? r.email : `${baseLocal}+${tag}@${baseDomain}`;\n  const products = (r.products || []).slice(0, 10);\n  const rows = products.map((p) => `<tr><td>${esc(p.product_name)}</td>` +\n    `<td>${p.interest_rate == null ? '-' : esc(p.interest_rate) + '%'}</td>` +\n    `<td>${p.min_income == null ? '-' : esc(p.min_income)}</td>` +\n    `<td>${p.min_credit_score == null ? '-' : esc(p.min_credit_score)}</td></tr>`).join('');\n  const html = `<p>Hi ${esc(r.name || 'there')},</p>` +\n    `<p>Based on your profile, you may qualify for these personal loans:</p>` +\n    `<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\"><tr><th>Product</th><th>Interest rate</th>` +\n    `<th>Min. monthly income</th><th>Min. credit score</th></tr>${rows}</table>` +\n    `<p>This is an indication only; final approval is up to the lender.</p>` +\n    (live ? '' : `<p><small>Test mode: originally addressed to ${esc(r.email)}</small></p>`);\n  out.push({ json: { to, from, subject: `You may qualify for ${products.length} personal loan offer(s)`,\n                     html, match_ids: r.match_ids, original_email: r.email, transport } });\n}\nreturn out.length ? out : [{ json: { empty: true } }];\n",
+        "mode": "runOnceForAllItems"
+      }
+    },
+    {
+      "id": "155998d7-1d1c-5ec3-a350-356e4ec0ca71",
+      "name": "Loop Emails",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1200,
+        300
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "85998dfa-c4bb-52c7-b439-81b58210d6d4",
+      "name": "Anything To Send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1440,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "empty",
+              "leftValue": "={{ $json.empty === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "7e784c0e-cb2e-58ee-b684-89c3d865df72",
+      "name": "Use SES?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1680,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ses",
+              "leftValue": "={{ $json.transport }}",
+              "rightValue": "ses",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "8c8d804f-249c-5435-b175-efdbc9bfea8f",
+      "name": "Send via AWS SES",
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "position": [
+        1920,
+        300
+      ],
+      "parameters": {
+        "resource": "email",
+        "operation": "send",
+        "fromEmail": "={{ $json.from }}",
+        "toAddresses": "={{ [$json.to] }}",
+        "subject": "={{ $json.subject }}",
+        "body": "={{ $json.html }}",
+        "isBodyHtml": true
+      },
+      "credentials": {
+        "aws": {
+          "id": "awscred",
+          "name": "AWS SES"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "a40b6bc6-672a-51e2-a9ec-279a8b7cf2e2",
+      "name": "SES Throttle (1/s)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2160,
+        300
+      ],
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": 1,
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "27d2685b-130f-5fa8-9cef-d799e26db873",
+      "name": "Send via SMTP",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2400,
+        300
+      ],
+      "parameters": {
+        "fromEmail": "={{ $json.from }}",
+        "toEmail": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "html",
+        "html": "={{ $json.html }}",
+        "options": {}
+      },
+      "credentials": {
+        "smtp": {
+          "id": "smtpcred",
+          "name": "Local Mailpit SMTP"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "74751df9-fbc3-56b2-af3d-0fdeabb4a70d",
+      "name": "Sent OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2640,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ok",
+              "leftValue": "={{ !!$json.error }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "e4d3f012-f791-55cd-bcd5-e81b7a331a0e",
+      "name": "Mark Notified",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2880,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE matches SET notified_at = now()\nWHERE id IN (SELECT jsonb_array_elements_text($1::jsonb)::bigint) AND notified_at IS NULL\nRETURNING id",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($('Build Emails').item.json.match_ids)] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgcred",
+          "name": "Loans Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "76f8bcde-588d-5dda-9d86-3b654dbb13c8",
+      "name": "Summary",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3120,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT count(*) FILTER (WHERE notified_at IS NOT NULL) AS notified_matches,\n       count(*) FILTER (WHERE notified_at IS NULL) AS pending_matches\nFROM matches WHERE upload_job_id = $1::uuid",
+        "options": {
+          "queryReplacement": "={{ [$('Config & Safety Checks').first().json.upload_job_id] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgcred",
+          "name": "Loans Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "executeOnce": true
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Checks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config & Safety Checks": {
+      "main": [
+        [
+          {
+            "node": "Fetch Pending Matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Pending Matches": {
+      "main": [
+        [
+          {
+            "node": "Build Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Emails": {
+      "main": [
+        [
+          {
+            "node": "Loop Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Emails": {
+      "main": [
+        [
+          {
+            "node": "Summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Anything To Send?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything To Send?": {
+      "main": [
+        [
+          {
+            "node": "Use SES?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Use SES?": {
+      "main": [
+        [
+          {
+            "node": "Send via AWS SES",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send via SMTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send via AWS SES": {
+      "main": [
+        [
+          {
+            "node": "SES Throttle (1/s)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SES Throttle (1/s)": {
+      "main": [
+        [
+          {
+            "node": "Sent OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send via SMTP": {
+      "main": [
+        [
+          {
+            "node": "Sent OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sent OK?": {
+      "main": [
+        [
+          {
+            "node": "Mark Notified",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Notified": {
+      "main": [
+        [
+          {
+            "node": "Loop Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "wfE_error"
+  },
+  "pinData": {}
+}

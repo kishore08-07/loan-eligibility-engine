@@ -1,0 +1,20 @@
+# secrets: never commit
+.env
+.env.*
+!.env.example
+!.env.aws.example
+deploy.env
+!deploy.env.example
+*.pem
+*.key
+.aws/
+
+# generated / local
+node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.serverless/
+backend/.requirements*/

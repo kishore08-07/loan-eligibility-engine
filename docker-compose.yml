@@ -1,0 +1,96 @@
+# Local development stack: Postgres, moto (S3/SQS emulator), Mailpit (SMTP sink), n8n.
+# The Python API/worker run on the host: see README.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    ports: ["5433:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/init-n8n-db.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d n8n"]
+      interval: 3s
+      retries: 20
+
+  moto:
+    image: motoserver/moto:latest
+    ports: ["5000:5000"]
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports: ["8025:8025", "1025:1025"]
+
+  # Optional free, unlimited local LLM (no API key): docker compose --profile ollama up -d ollama
+  # then: docker compose exec ollama ollama pull qwen2.5:3b   and set LLM_PROVIDER=ollama in .env
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    ports: ["11434:11434"]
+    volumes:
+      - ollama_data:/root/.ollama
+
+  # One-shot: imports credentials + workflows into n8n's DB, then exits.
+  n8n-init:
+    image: n8nio/n8n:latest
+    user: root
+    entrypoint: ["/bin/sh", "/init/init.sh"]
+    environment: &n8n-env
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      NODE_FUNCTION_ALLOW_BUILTIN: crypto
+      N8N_RUNNERS_ENABLED: "true"
+      GENERIC_TIMEZONE: UTC
+      WEBHOOK_URL: http://localhost:5678/
+      # business config read by workflows via $$env
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+      LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+      TEST_RECIPIENT: ${TEST_RECIPIENT:-}
+      NOTIFY_MAX_EMAILS: ${NOTIFY_MAX_EMAILS:-}
+      NOTIFY_LIVE: ${NOTIFY_LIVE:-false}
+      EMAIL_TRANSPORT: ${EMAIL_TRANSPORT:-smtp}
+      SES_FROM: ${SES_FROM:-}
+      # credentials created by init.sh
+      APP_DB_HOST: ${APP_DB_HOST:-postgres}
+      APP_DB_PORT: ${APP_DB_PORT:-5432}
+      APP_DB_NAME: ${APP_DB_NAME:-loans}
+      APP_DB_USER: ${POSTGRES_USER}
+      APP_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      APP_DB_SSL: ${APP_DB_SSL:-disable}
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      AWS_SES_ACCESS_KEY_ID: ${AWS_SES_ACCESS_KEY_ID:-}
+      AWS_SES_SECRET_ACCESS_KEY: ${AWS_SES_SECRET_ACCESS_KEY:-}
+      AWS_SES_REGION: ${AWS_SES_REGION:-us-east-1}
+    volumes:
+      - ./n8n:/init:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    ports: ["5678:5678"]
+    environment: *n8n-env
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      n8n-init: {condition: service_completed_successfully}
+
+volumes:
+  ollama_data:
+  pgdata:
+  n8n_data:

@@ -1,0 +1,366 @@
+# AWS deployment (run from backend/):  npx serverless deploy --stage dev
+# Required env vars at deploy time: see README "AWS deployment".
+service: loan-eligibility-engine
+frameworkVersion: ">=3.38.0"
+
+plugins:
+  - serverless-python-requirements
+
+custom:
+  prefix: ${self:service}-${sls:stage}
+  bucket: ${self:custom.prefix}-uploads-${aws:accountId}
+  pythonRequirements:
+    dockerizePip: true          # builds Linux wheels for psycopg[binary]
+    fileName: requirements.txt
+    slim: true
+
+package:
+  individually: false
+  patterns:
+    - "!**"
+    - "app/**"
+    - "migrations/**"
+    - "seed/**"
+    - "!**/__pycache__/**"
+
+provider:
+  name: aws
+  runtime: python3.12
+  region: ${env:AWS_REGION, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 512
+  timeout: 25                    # API Gateway HTTP API caps at 30 s; leave headroom
+  logRetentionInDays: 30
+  vpc:
+    securityGroupIds:
+      - !Ref LambdaSecurityGroup
+    subnetIds:
+      - ${env:SUBNET_A_ID}
+      - ${env:SUBNET_B_ID}
+  httpApi:
+    cors:
+      allowedOrigins:
+        - ${env:CORS_ORIGIN, '*'}
+      allowedMethods: [GET, POST, OPTIONS]
+      allowedHeaders: [Content-Type]
+  environment:
+    UPLOAD_BUCKET: ${self:custom.bucket}
+    DB_HOST: !GetAtt Database.Endpoint.Address
+    DB_PORT: "5432"
+    DB_NAME: loans
+    DB_USER: loans
+    DB_PASSWORD: ${env:DB_PASSWORD}
+    N8N_MATCH_WEBHOOK_URL: !Sub "http://${N8nInstance.PrivateIp}:5678/webhook/match-users"
+    WEBHOOK_SECRET: ${env:WEBHOOK_SECRET}
+    MAX_RECEIVE_COUNT: "3"
+  iam:
+    role:
+      statements:
+        - Effect: Allow            # presigned POST is signed with this role; error reports are read back
+          Action: [s3:PutObject, s3:GetObject]
+          Resource: !Sub "arn:aws:s3:::${self:custom.bucket}/*"
+
+functions:
+  health:
+    handler: app.handlers.api.health
+    events: [{httpApi: {method: GET, path: /health}}]
+  createUpload:
+    handler: app.handlers.api.create_upload
+    events: [{httpApi: {method: POST, path: /uploads}}]
+  listUploads:
+    handler: app.handlers.api.list_uploads
+    events: [{httpApi: {method: GET, path: /uploads}}]
+  getUpload:
+    handler: app.handlers.api.get_upload
+    events: [{httpApi: {method: GET, path: "/uploads/{job_id}"}}]
+  listMatches:
+    handler: app.handlers.api.list_matches
+    events: [{httpApi: {method: GET, path: "/uploads/{job_id}/matches"}}]
+
+  ingest:
+    handler: app.handlers.ingest.handler
+    memorySize: 1024
+    timeout: 300
+    events:
+      - sqs:
+          arn: !GetAtt IngestQueue.Arn
+          batchSize: 1
+          functionResponseType: ReportBatchItemFailures   # only failed messages are retried
+
+  migrate:                         # run once after deploy: npx serverless invoke -f migrate
+    handler: app.handlers.migrate.handler
+    timeout: 120
+
+  seed:                            # run once after migrate: npx serverless invoke -f seed
+    handler: app.handlers.seed.handler
+    timeout: 60
+
+  resendWebhook:                   # re-trigger matching: npx serverless invoke -f resendWebhook --data '{"job_id":"<uuid>"}'
+    handler: app.handlers.resend.handler
+    timeout: 30
+
+resources:
+  Conditions:
+    HasAlertEmail: !Not [!Equals ["${env:ALERT_EMAIL, ''}", ""]]
+    HasRecipient1: !Not [!Equals ["${env:SES_RECIPIENT_1, ''}", ""]]
+    HasRecipient2: !Not [!Equals ["${env:SES_RECIPIENT_2, ''}", ""]]
+    HasRecipient3: !Not [!Equals ["${env:SES_RECIPIENT_3, ''}", ""]]
+
+  Resources:
+    # ---------------- ingestion path: S3 -> SQS (+DLQ) -> Lambda ----------------
+    UploadBucket:
+      Type: AWS::S3::Bucket
+      DependsOn: IngestQueuePolicy
+      Properties:
+        BucketName: ${self:custom.bucket}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+        CorsConfiguration:
+          CorsRules:
+            - AllowedMethods: [POST, GET]
+              AllowedOrigins: ["${env:CORS_ORIGIN, '*'}"]
+              AllowedHeaders: ["*"]
+        LifecycleConfiguration:
+          Rules:
+            - {Id: expire-uploads, Status: Enabled, ExpirationInDays: 30}
+        NotificationConfiguration:
+          QueueConfigurations:
+            - Event: s3:ObjectCreated:*
+              Queue: !GetAtt IngestQueue.Arn
+              Filter:
+                S3Key:
+                  Rules: [{Name: prefix, Value: uploads/}]
+
+    IngestDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.prefix}-ingest-dlq
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+
+    IngestQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.prefix}-ingest
+        VisibilityTimeout: 1800        # >= 6x the ingest Lambda timeout (AWS guidance)
+        SqsManagedSseEnabled: true
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt IngestDLQ.Arn
+          maxReceiveCount: 3
+
+    IngestQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues: [!Ref IngestQueue]
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal: {Service: s3.amazonaws.com}
+              Action: sqs:SendMessage
+              Resource: !GetAtt IngestQueue.Arn
+              Condition:
+                ArnLike: {"aws:SourceArn": "arn:aws:s3:::${self:custom.bucket}"}
+                StringEquals: {"aws:SourceAccount": "${aws:accountId}"}
+
+    AlertsTopic:
+      Type: AWS::SNS::Topic
+    AlertsSubscription:
+      Type: AWS::SNS::Subscription
+      Condition: HasAlertEmail
+      Properties:
+        TopicArn: !Ref AlertsTopic
+        Protocol: email
+        Endpoint: ${env:ALERT_EMAIL, ''}
+    DlqAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmDescription: A CSV upload failed all retries and landed in the DLQ
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions: [{Name: QueueName, Value: !GetAtt IngestDLQ.QueueName}]
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: [!Ref AlertsTopic]
+
+    # ---------------- network + database ----------------
+    LambdaSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Lambda functions
+        VpcId: ${env:VPC_ID}
+    DbSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: RDS Postgres
+        VpcId: ${env:VPC_ID}
+        SecurityGroupIngress:
+          - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref LambdaSecurityGroup}
+          - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref N8nSecurityGroup}
+    # Lets the Lambdas call the n8n host's webhook (port 5678) inside the VPC.
+    N8nIngressFromLambda:
+      Type: AWS::EC2::SecurityGroupIngress
+      Properties:
+        GroupId: !Ref N8nSecurityGroup
+        IpProtocol: tcp
+        FromPort: 5678
+        ToPort: 5678
+        SourceSecurityGroupId: !Ref LambdaSecurityGroup
+    S3Endpoint:                     # Lambdas have no internet route; S3 goes through this free gateway endpoint
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        VpcId: ${env:VPC_ID}
+        ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+        VpcEndpointType: Gateway
+        RouteTableIds: ["${env:ROUTE_TABLE_ID}"]
+    DbSubnetGroup:
+      Type: AWS::RDS::DBSubnetGroup
+      Properties:
+        DBSubnetGroupDescription: ${self:custom.prefix}
+        SubnetIds: ["${env:SUBNET_A_ID}", "${env:SUBNET_B_ID}"]
+    Database:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Snapshot
+      UpdateReplacePolicy: Snapshot
+      Properties:
+        Engine: postgres
+        EngineVersion: ${env:DB_ENGINE_VERSION, "17"}
+        DBInstanceClass: ${env:DB_INSTANCE_CLASS, 'db.t4g.micro'}
+        AllocatedStorage: 20
+        StorageType: gp3
+        StorageEncrypted: true
+        DBName: loans
+        MasterUsername: loans
+        MasterUserPassword: ${env:DB_PASSWORD}
+        MultiAZ: ${env:DB_MULTI_AZ, 'false'}        # single-AZ for the assignment; set true in production
+        BackupRetentionPeriod: ${env:DB_BACKUP_RETENTION_DAYS, '1'}   # free-tier accounts reject >1; set 7 on a paid plan
+        PubliclyAccessible: false
+        DBSubnetGroupName: !Ref DbSubnetGroup
+        VPCSecurityGroups: [!Ref DbSecurityGroup]
+
+    # ---------------- email: SES identities (sandbox: sender and every recipient must be verified) ----------------
+    # CloudFormation sends each address a verification mail; click the link once.
+    SesSender:
+      Type: AWS::SES::EmailIdentity
+      Properties: {EmailIdentity: "${env:SES_SENDER_EMAIL}"}
+    SesRecipient1:
+      Type: AWS::SES::EmailIdentity
+      Condition: HasRecipient1
+      Properties: {EmailIdentity: "${env:SES_RECIPIENT_1, ''}"}
+    SesRecipient2:
+      Type: AWS::SES::EmailIdentity
+      Condition: HasRecipient2
+      Properties: {EmailIdentity: "${env:SES_RECIPIENT_2, ''}"}
+    SesRecipient3:
+      Type: AWS::SES::EmailIdentity
+      Condition: HasRecipient3
+      Properties: {EmailIdentity: "${env:SES_RECIPIENT_3, ''}"}
+
+    # ---------------- n8n host: one EC2 instance in the same VPC, reachable only from the Lambdas ----------------
+    N8nSecurityGroup:                # no inbound rules of its own; the Lambdas get port 5678 via N8nIngressFromLambda
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: n8n host
+        VpcId: ${env:VPC_ID}
+    N8nRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Statement:
+            - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: "sts:AssumeRole"}
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore    # shell + editor access without open ports
+        Policies:
+          - PolicyName: read-n8n-bundle
+            PolicyDocument:
+              Statement:
+                - {Effect: Allow, Action: "s3:GetObject", Resource: !Sub "arn:aws:s3:::${self:custom.bucket}/deploy/*"}
+    N8nInstanceProfile:
+      Type: AWS::IAM::InstanceProfile
+      Properties: {Roles: [!Ref N8nRole]}
+    N8nSesUser:                      # credentials for the n8n "AWS SES" node: may only send mail
+      Type: AWS::IAM::User
+      Properties:
+        Policies:
+          - PolicyName: ses-send
+            PolicyDocument:
+              Statement:
+                - {Effect: Allow, Action: ["ses:SendEmail", "ses:SendRawEmail"], Resource: "*"}
+    N8nSesAccessKey:
+      Type: AWS::IAM::AccessKey
+      Properties: {UserName: !Ref N8nSesUser}
+    N8nInstance:
+      Type: AWS::EC2::Instance
+      Properties:
+        ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+        InstanceType: ${env:N8N_INSTANCE_TYPE, 't3.small'}
+        IamInstanceProfile: !Ref N8nInstanceProfile
+        MetadataOptions: {HttpTokens: required}
+        NetworkInterfaces:           # public IP only so n8n can reach the lender sites, Gemini and SES
+          - AssociatePublicIpAddress: true
+            DeviceIndex: "0"
+            SubnetId: ${env:SUBNET_A_ID}
+            GroupSet: [!Ref N8nSecurityGroup]
+        Tags: [{Key: Name, Value: "${self:custom.prefix}-n8n"}]
+        # Installs Docker, waits for the workflow bundle (infra/upload_n8n_bundle.sh), then starts n8n.
+        # Secrets are passed through user-data: acceptable for this assignment; use Secrets Manager in production.
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                #!/bin/bash
+                exec > /var/log/n8n-bootstrap.log 2>&1
+                dnf install -y docker
+                systemctl enable --now docker
+                mkdir -p /usr/local/lib/docker/cli-plugins /opt/n8n
+                curl -fsSL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+                  -o /usr/local/lib/docker/cli-plugins/docker-compose
+                chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+                cd /opt/n8n
+                until aws s3 cp s3://${self:custom.bucket}/deploy/n8n-bundle.tgz . --region ${AWS::Region}; do sleep 20; done
+                tar xzf n8n-bundle.tgz
+                cat > .env.aws <<'EOF'
+                N8N_ENCRYPTION_KEY=${env:N8N_ENCRYPTION_KEY}
+                WEBHOOK_SECRET=${env:WEBHOOK_SECRET}
+                APP_DB_HOST=${DbHost}
+                APP_DB_PASSWORD=${env:DB_PASSWORD}
+                LLM_PROVIDER=${env:LLM_PROVIDER, 'gemini'}
+                GEMINI_API_KEY=${env:GEMINI_API_KEY, ''}
+                GEMINI_MODEL=${env:GEMINI_MODEL, 'gemini-3.5-flash-lite'}
+                TEST_RECIPIENT=${env:TEST_RECIPIENT}
+                NOTIFY_MAX_EMAILS=${env:NOTIFY_MAX_EMAILS, '3'}
+                NOTIFY_LIVE=false
+                SES_FROM=${env:SES_SENDER_EMAIL}
+                SES_TO=${env:TEST_RECIPIENT}
+                AWS_SES_ACCESS_KEY_ID=${SesKeyId}
+                AWS_SES_SECRET_ACCESS_KEY=${SesSecret}
+                AWS_SES_REGION=${AWS::Region}
+                N8N_PUBLIC_URL=http://localhost:5678/
+                EOF
+                chmod 600 .env.aws
+                docker compose -f docker-compose.aws.yml --env-file .env.aws up -d
+              - DbHost: !GetAtt Database.Endpoint.Address
+                SesKeyId: !Ref N8nSesAccessKey
+                SesSecret: !GetAtt N8nSesAccessKey.SecretAccessKey
+
+  Outputs:
+    # HttpApiUrl is generated by the framework itself (re-declaring it breaks the template).
+    UploadBucketName:
+      Value: ${self:custom.bucket}
+    IngestQueueUrl:
+      Value: !Ref IngestQueue
+    DatabaseEndpoint:
+      Value: !GetAtt Database.Endpoint.Address
+    N8nInstanceId:
+      Value: !Ref N8nInstance
+    N8nPrivateIp:
+      Value: !GetAtt N8nInstance.PrivateIp

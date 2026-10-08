@@ -1,0 +1,57 @@
+{
+  "id": "wfE_error",
+  "name": "E - Error handler",
+  "nodes": [
+    {
+      "id": "9d78339e-f95b-5b50-a0a5-3c63e3bbfd20",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "93e5c174-276e-54b1-a9d3-47e3e061a54b",
+      "name": "Mark Matching Failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE upload_jobs SET matching_status = 'FAILED', updated_at = now() WHERE matching_execution_id = $1 AND matching_status = 'RUNNING' RETURNING id",
+        "options": {
+          "queryReplacement": "={{ [String($json.execution.id)] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgcred",
+          "name": "Loans Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Mark Matching Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

@@ -1,0 +1,57 @@
+# n8n on an EC2 host inside the same VPC as RDS + the Lambdas.  Usage: see README "AWS deployment".
+#   docker compose -f docker-compose.aws.yml --env-file .env.aws up -d
+# n8n keeps its own state in SQLite on the n8n_data volume (single instance).
+x-n8n-env: &n8n-env
+  N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+  N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+  NODE_FUNCTION_ALLOW_BUILTIN: crypto
+  GENERIC_TIMEZONE: UTC
+  WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+  LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+  OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+  TEST_RECIPIENT: ${TEST_RECIPIENT:-}
+  NOTIFY_MAX_EMAILS: ${NOTIFY_MAX_EMAILS:-}
+  NOTIFY_LIVE: ${NOTIFY_LIVE:-false}
+  EMAIL_TRANSPORT: ses
+  SES_FROM: ${SES_FROM}
+  APP_DB_HOST: ${APP_DB_HOST}
+  APP_DB_PORT: "5432"
+  APP_DB_NAME: loans
+  APP_DB_USER: loans
+  APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+  APP_DB_SSL: require
+  SMTP_HOST: unused
+  SMTP_PORT: "25"
+  AWS_SES_ACCESS_KEY_ID: ${AWS_SES_ACCESS_KEY_ID}
+  AWS_SES_SECRET_ACCESS_KEY: ${AWS_SES_SECRET_ACCESS_KEY}
+  AWS_SES_REGION: ${AWS_SES_REGION:-us-east-1}
+
+services:
+  n8n-init:
+    image: n8nio/n8n:latest
+    user: root
+    entrypoint: ["/bin/sh", "/init/init.sh"]
+    environment:
+      <<: *n8n-env
+      N8N_USER_FOLDER: /home/node     # root's default would be /root/.n8n, not the shared volume
+    volumes:
+      - ./n8n:/init:ro
+      - n8n_data:/home/node/.n8n
+
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    ports: ["5678:5678"]
+    environment:
+      <<: *n8n-env
+      WEBHOOK_URL: ${N8N_PUBLIC_URL:-http://localhost:5678/}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      n8n-init: {condition: service_completed_successfully}
+
+volumes:
+  n8n_data:
