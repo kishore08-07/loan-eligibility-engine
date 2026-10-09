@@ -26,6 +26,7 @@ ROUTES = [
     ("GET", r"^/uploads$", api.list_uploads, []),
     ("GET", r"^/uploads/(?P<job_id>[^/]+)$", api.get_upload, ["job_id"]),
     ("GET", r"^/uploads/(?P<job_id>[^/]+)/matches$", api.list_matches, ["job_id"]),
+    ("POST", r"^/uploads/(?P<job_id>[^/]+)/reprocess$", api.reprocess_upload, ["job_id"]),
 ]
 
 
@@ -43,6 +44,7 @@ class Handler(BaseHTTPRequestHandler):
             match = re.match(pattern, url.path)
             if route_method == method and match:
                 event = {"rawPath": url.path, "body": body,
+                         "headers": {k.lower(): v for k, v in self.headers.items()},
                          "pathParameters": match.groupdict(),
                          "queryStringParameters": {k: v[0] for k, v in parse_qs(url.query).items()},
                          "requestContext": {"http": {"method": method}}}

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { getMatches, getUpload, health, listUploads, onApiCall, uploadCsv } from "./api.js";
+import { getMatches, getUpload, health, listUploads, onApiCall, reprocessUpload, uploadCsv } from "./api.js";
 
 const REQUIRED = ["user_id", "email", "monthly_income", "credit_score", "employment_status", "age"];
 
@@ -122,9 +122,21 @@ function Matches({ jobId }) {
   );
 }
 
-function JobDetail({ jobId, onEvent }) {
+function JobDetail({ jobId, onEvent, onOpen }) {
   const [job, setJob] = useState(null);
   const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  async function processAnyway() {
+    setBusy(true); setError(null);
+    try {
+      const id = await reprocessUpload(jobId);
+      onEvent(`process anyway: new job ${id.slice(0, 8)}`);
+      onOpen(id);
+    } catch (e) {
+      setError(e.message); setBusy(false);
+    }
+  }
 
   useEffect(() => {
     let stop = false;
@@ -166,6 +178,13 @@ function JobDetail({ jobId, onEvent }) {
       {error && <p className="error">{error}</p>}
       {job.rejected_rows > 0 && job.error_report_url &&
         <p className="muted">{job.rejected_rows} rows rejected · <a href={job.error_report_url}>download error report</a></p>}
+      {job.status === "DUPLICATE" && (
+        <div className="notice">
+          <p>An identical file was already processed, so this upload was skipped to avoid sending duplicate offers.
+            Want to run it through the pipeline again anyway?</p>
+          <button className="btn" disabled={busy} onClick={processAnyway}>{busy ? "Starting…" : "Process anyway"}</button>
+        </div>
+      )}
       <Pipeline job={job} />
       <Stats job={job} />
       {job.matches > 0 && <div style={{ marginTop: 24 }}><Matches jobId={jobId} /></div>}
@@ -256,7 +275,7 @@ export default function App() {
       {progress !== null && !jobId && (
         <section className="card"><h2>Progress</h2><Pipeline job={null} uploading progress={progress} /></section>
       )}
-      {jobId && <JobDetail key={jobId} jobId={jobId} onEvent={(t) => addLog(t, "ev")} />}
+      {jobId && <JobDetail key={jobId} jobId={jobId} onEvent={(t) => addLog(t, "ev")} onOpen={setJobId} />}
 
       <section className="card">
         <h2>Trace</h2>

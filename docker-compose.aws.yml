@@ -12,6 +12,7 @@ x-n8n-env: &n8n-env
   GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
   OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
   OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+  MATCH_TOP_K: ${MATCH_TOP_K:-all}
   TEST_RECIPIENT: ${TEST_RECIPIENT:-}
   NOTIFY_MAX_EMAILS: ${NOTIFY_MAX_EMAILS:-}
   NOTIFY_LIVE: ${NOTIFY_LIVE:-false}
@@ -31,7 +32,7 @@ x-n8n-env: &n8n-env
 
 services:
   n8n-init:
-    image: n8nio/n8n:latest
+    image: n8nio/n8n:2.42.5
     user: root
     entrypoint: ["/bin/sh", "/init/init.sh"]
     environment:
@@ -42,7 +43,7 @@ services:
       - n8n_data:/home/node/.n8n
 
   n8n:
-    image: n8nio/n8n:latest
+    image: n8nio/n8n:2.42.5
     restart: unless-stopped
     ports: ["5678:5678"]
     environment:

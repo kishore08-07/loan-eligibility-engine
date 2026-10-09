@@ -1,4 +1,7 @@
 {
+  "scripts": {
+    "deploy": "serverless deploy --stage ${STAGE:-dev} && serverless invoke -f migrate --stage ${STAGE:-dev}"
+  },
   "devDependencies": {
     "serverless": "^3.40.0",
     "serverless-python-requirements": "^6.1.2"

@@ -34,5 +34,14 @@ N8N_MATCH_WEBHOOK_URL = _env("N8N_MATCH_WEBHOOK_URL")
 WEBHOOK_SECRET = _env("WEBHOOK_SECRET")
 WEBHOOK_TIMEOUT_SECONDS = int(_env("WEBHOOK_TIMEOUT_SECONDS", "10"))
 
+# Optional shared secret for the HTTP API (x-api-key header). Unset = open API (local dev).
+API_KEY = _env("API_KEY")
+
+# Housekeeping (handlers/maintenance.py): a PENDING job whose file never arrived is expired after this long
+# (> the presigned-POST lifetime). A PROCESSING job is only failed after SQS has had its chance to retry:
+# MAX_RECEIVE_COUNT x queue visibility timeout (30 min) plus a margin.
+PENDING_EXPIRY_MINUTES = int(_env("PENDING_EXPIRY_MINUTES", "60"))
+PROCESSING_EXPIRY_MINUTES = int(_env("PROCESSING_EXPIRY_MINUTES", "100"))
+
 # After this many SQS deliveries the job is marked FAILED (matches the DLQ maxReceiveCount).
 MAX_RECEIVE_COUNT = int(_env("MAX_RECEIVE_COUNT", "3"))

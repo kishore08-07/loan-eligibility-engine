@@ -8,5 +8,6 @@ for (const r of $('Load Crawl State').all()) if (r.json.source) state[r.json.sou
 const SOURCES = [
   { source: 'bankbazaar', url: 'https://www.bankbazaar.com/personal-loan.html' },
   { source: 'hdfcbank', url: 'https://www.hdfcbank.com/personal/borrow/popular-loans/personal-loan' },
+  { source: 'icicibank', url: 'https://www.icicibank.com/personal-banking/loans/personal-loan' },
 ];
 return SOURCES.map((s) => ({ json: { ...s, previous_hash: state[s.source] || null } }));

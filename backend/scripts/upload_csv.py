@@ -1,19 +1,23 @@
 """CLI equivalent of the UI: upload a CSV through the presigned-URL flow and follow the job.
 
-usage: python scripts/upload_csv.py ../users.csv [--api http://localhost:8000]
+usage: python scripts/upload_csv.py ../users.csv [--api http://localhost:8000]   (API_KEY env var is sent if set)
 """
 import argparse
 import json
-import mimetypes
+import os
 import pathlib
 import time
 import urllib.request
 import uuid
 
 
+API_KEY = os.environ.get("API_KEY", "")
+
+
 def call(method, url, data=None):
+    headers = {"Content-Type": "application/json", **({"x-api-key": API_KEY} if API_KEY else {})}
     req = urllib.request.Request(url, data=json.dumps(data).encode() if data is not None else None,
-                                 method=method, headers={"Content-Type": "application/json"})
+                                 method=method, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read())
 

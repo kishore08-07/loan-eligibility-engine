@@ -1,5 +1,7 @@
 const API = (import.meta.env.VITE_API_URL || "http://localhost:8000").replace(/\/$/, "");
 
+const API_KEY = import.meta.env.VITE_API_KEY || "";
+
 const listeners = new Set();
 /** Subscribe to every API call (method, path, status, ms) so the UI can show what is happening. */
 export const onApiCall = (fn) => { listeners.add(fn); return () => listeners.delete(fn); };
@@ -12,7 +14,10 @@ async function request(path, options) {
   const t0 = performance.now();
   let res;
   try {
-    res = await fetch(`${API}${path}`, options);
+    res = await fetch(`${API}${path}`, {
+      ...options,
+      headers: { ...(options && options.headers), ...(API_KEY ? { "X-Api-Key": API_KEY } : {}) },
+    });
   } catch (e) {
     emit({ method, path, status: "ERR", ms: Math.round(performance.now() - t0) });
     throw e;
@@ -28,6 +33,8 @@ async function request(path, options) {
 export const health = () => request("/health");
 export const listUploads = () => request("/uploads");
 export const getUpload = (id) => request(`/uploads/${id}`);
+/** "Process anyway": re-run the pipeline for a file that was rejected as a duplicate. Returns the new job id. */
+export const reprocessUpload = (id) => request(`/uploads/${id}/reprocess`, { method: "POST" }).then((r) => r.job_id);
 export const getMatches = (id, offset = 0, limit = 25) =>
   request(`/uploads/${id}/matches?offset=${offset}&limit=${limit}`);
 

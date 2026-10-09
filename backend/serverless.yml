@@ -42,7 +42,7 @@ provider:
       allowedOrigins:
         - ${env:CORS_ORIGIN, '*'}
       allowedMethods: [GET, POST, OPTIONS]
-      allowedHeaders: [Content-Type]
+      allowedHeaders: [Content-Type, X-Api-Key]
   environment:
     UPLOAD_BUCKET: ${self:custom.bucket}
     DB_HOST: !GetAtt Database.Endpoint.Address
@@ -53,6 +53,7 @@ provider:
     N8N_MATCH_WEBHOOK_URL: !Sub "http://${N8nInstance.PrivateIp}:5678/webhook/match-users"
     WEBHOOK_SECRET: ${env:WEBHOOK_SECRET}
     MAX_RECEIVE_COUNT: "3"
+    API_KEY: ${env:API_KEY, ''}                # empty = open API; set it and put the same value in the UI as VITE_API_KEY
   iam:
     role:
       statements:
@@ -67,6 +68,9 @@ functions:
   createUpload:
     handler: app.handlers.api.create_upload
     events: [{httpApi: {method: POST, path: /uploads}}]
+  reprocessUpload:
+    handler: app.handlers.api.reprocess_upload
+    events: [{httpApi: {method: POST, path: "/uploads/{job_id}/reprocess"}}]
   listUploads:
     handler: app.handlers.api.list_uploads
     events: [{httpApi: {method: GET, path: /uploads}}]
@@ -85,7 +89,14 @@ functions:
       - sqs:
           arn: !GetAtt IngestQueue.Arn
           batchSize: 1
+          maximumConcurrency: 2        # caps parallel ingests so a burst of uploads cannot exhaust RDS connections
           functionResponseType: ReportBatchItemFailures   # only failed messages are retried
+
+  maintenance:                     # fails jobs that can never finish (upload never arrived / every attempt timed out)
+    handler: app.handlers.maintenance.handler
+    timeout: 30
+    events:
+      - schedule: rate(15 minutes)
 
   migrate:                         # run once after deploy: npx serverless invoke -f migrate
     handler: app.handlers.migrate.handler

@@ -59,6 +59,12 @@ def _set_job(conn, job_id: str, **fields) -> None:
                  {**fields, "id": job_id})
 
 
+def _status(conn, job_id: str) -> str | None:
+    row = conn.execute("SELECT status FROM upload_jobs WHERE id = %s", (job_id,)).fetchone()
+    conn.rollback()
+    return row[0] if row else None
+
+
 def _fail(conn, job_id: str, message: str) -> Result:
     conn.rollback()
     conn.execute("UPDATE upload_jobs SET status = 'FAILED', error_message = %s, "
@@ -71,11 +77,12 @@ def _fail(conn, job_id: str, message: str) -> Result:
 def process_upload(conn: psycopg.Connection, bucket: str, key: str, final_attempt: bool = False) -> Result:
     """Process one uploaded object. Raises on transient errors so SQS retries the message."""
     job_id = job_id_from_key(key)
-    row = conn.execute("SELECT status, webhook_delivered_at FROM upload_jobs WHERE id = %s", (job_id,)).fetchone()
+    row = conn.execute("SELECT status, webhook_delivered_at, allow_duplicate FROM upload_jobs WHERE id = %s",
+                       (job_id,)).fetchone()
     conn.rollback()
     if row is None:
         raise PermanentError(f"no upload job {job_id}")
-    status, delivered_at = row
+    status, delivered_at, allow_duplicate = row
 
     if status in DONE_STATUSES:  # redelivery after success: only the webhook may be missing
         if delivered_at is None:
@@ -85,22 +92,23 @@ def process_upload(conn: psycopg.Connection, bucket: str, key: str, final_attemp
         return Result(job_id, status)
 
     try:
-        return _load(conn, job_id, bucket, key)
+        return _load(conn, job_id, bucket, key, allow_duplicate)
     except PermanentError as exc:
         return _fail(conn, job_id, str(exc))
     except Exception as exc:
         conn.rollback()
-        if final_attempt:
+        # A failed webhook after a successful load must not turn the loaded job into FAILED.
+        if final_attempt and _status(conn, job_id) not in DONE_STATUSES:
             _fail(conn, job_id, f"gave up after retries: {exc}")
         raise
 
 
-def _load(conn: psycopg.Connection, job_id: str, bucket: str, key: str) -> Result:
+def _load(conn: psycopg.Connection, job_id: str, bucket: str, key: str, allow_duplicate: bool = False) -> Result:
     _set_job(conn, job_id, status="PROCESSING")
     conn.commit()
 
     file_hash = _hash_object(bucket, key)
-    original = conn.execute(
+    original = None if allow_duplicate else conn.execute(
         "SELECT id FROM upload_jobs WHERE file_hash = %s AND status = ANY(%s) AND id <> %s",
         (file_hash, list(DONE_STATUSES), job_id)).fetchone()
     if original:
@@ -158,7 +166,8 @@ def _load(conn: psycopg.Connection, job_id: str, bucket: str, key: str) -> Resul
     error_key = _write_error_report(bucket, job_id, rejected) if rejected else None
     final_status = "COMPLETED_WITH_ERRORS" if rejected else "COMPLETED"
     try:
-        _set_job(conn, job_id, status=final_status, file_hash=file_hash, total_rows=total,
+        # a deliberate re-process keeps no hash: the original upload stays the one that duplicates are compared with
+        _set_job(conn, job_id, status=final_status, file_hash=None if allow_duplicate else file_hash, total_rows=total,
                  valid_rows=valid, rejected_rows=len(rejected), error_key=error_key)
         conn.execute("UPDATE upload_jobs SET finished_at = now() WHERE id = %s", (job_id,))
         conn.commit()
@@ -193,3 +202,21 @@ def _dispatch(conn: psycopg.Connection, job_id: str) -> None:
     conn.execute("UPDATE upload_jobs SET webhook_delivered_at = now(), updated_at = now() WHERE id = %s", (job_id,))
     conn.commit()
     log(logger, "webhook delivered", job_id=job_id)
+
+
+def expire_stale_jobs(conn: psycopg.Connection, pending_minutes: int, processing_minutes: int) -> dict[str, int]:
+    """Fail jobs that can never finish on their own.
+
+    * PENDING: the browser never completed the S3 upload.
+    * PROCESSING: every SQS attempt crashed or timed out (a Lambda timeout raises nothing we could catch,
+      so the message ends up in the DLQ with the job still marked PROCESSING).
+    """
+    sql = ("UPDATE upload_jobs SET status = 'FAILED', error_message = %s, finished_at = now(), updated_at = now() "
+           "WHERE status = %s AND updated_at < now() - make_interval(mins => %s) RETURNING id")
+    expired = conn.execute(sql, ("file was never uploaded", "PENDING", pending_minutes)).fetchall()
+    stuck = conn.execute(sql, ("processing did not finish (timed out or crashed on every attempt)",
+                               "PROCESSING", processing_minutes)).fetchall()
+    conn.commit()
+    result = {"pending_expired": len(expired), "processing_failed": len(stuck)}
+    log(logger, "stale jobs expired", **result)
+    return result

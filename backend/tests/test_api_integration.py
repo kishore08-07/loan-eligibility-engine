@@ -48,3 +48,52 @@ def test_get_upload_and_matches(env):
 def test_unknown_and_invalid_job_ids(env):
     assert api.get_upload(_event(path={"job_id": "not-a-uuid"}))["statusCode"] == 400
     assert api.get_upload(_event(path={"job_id": "0" * 8 + "-0000-0000-0000-" + "0" * 12}))["statusCode"] == 404
+
+
+def test_api_key_is_enforced_when_configured(env, monkeypatch):
+    from app import config
+    monkeypatch.setattr(config, "API_KEY", "s3cret")
+    assert api.list_uploads({})["statusCode"] == 401
+    assert api.list_uploads({"headers": {"x-api-key": "wrong"}})["statusCode"] == 401
+    assert api.list_uploads({"headers": {"x-api-key": "s3cret"}})["statusCode"] == 200
+    assert api.health({})["statusCode"] == 200  # health stays public for uptime checks
+
+
+def test_list_uploads_newest_first_and_match_pagination(env):
+    conn, _, _ = env
+    first = json.loads(api.create_upload(_event({"filename": "a.csv"}))["body"])["job_id"]
+    second = json.loads(api.create_upload(_event({"filename": "b.csv"}))["body"])["job_id"]
+    items = json.loads(api.list_uploads({})["body"])["items"]
+    assert [i["id"] for i in items] == [second, first]
+
+    conn.execute("INSERT INTO loan_products (source, product_name) SELECT 's', 'P' || g FROM generate_series(1, 3) g")
+    conn.execute("INSERT INTO users VALUES ('u1','A','a@x.com',50000,700,'Salaried',30,%s,now(),now())", (first,))
+    conn.execute("INSERT INTO matches (upload_job_id, user_id, product_id, score, match_stage) "
+                 "SELECT %s, 'u1', id, 50, 'rules' FROM loan_products", (first,))
+    conn.commit()
+    page = json.loads(api.list_matches(_event(path={"job_id": first}, query={"limit": "2", "offset": "2"}))["body"])
+    assert page["total"] == 3 and len(page["items"]) == 1
+    clamped = json.loads(api.list_matches(_event(path={"job_id": first}, query={"limit": "9999"}))["body"])
+    assert clamped["limit"] == 200
+
+
+def test_reprocess_duplicate_creates_a_forced_job_and_copies_the_file(env):
+    conn, s3, _ = env
+    from tests.conftest import BUCKET
+    created = json.loads(api.create_upload(_event({"filename": "u.csv"}))["body"])
+    job_id = created["job_id"]
+    s3.put_object(Bucket=BUCKET, Key=f"uploads/{job_id}.csv", Body=b"user_id\n")
+
+    not_dup = api.reprocess_upload(_event(path={"job_id": job_id}))
+    assert not_dup["statusCode"] == 409  # only DUPLICATE jobs qualify
+
+    conn.execute("UPDATE upload_jobs SET status = 'DUPLICATE' WHERE id = %s", (job_id,))
+    conn.commit()
+    resp = api.reprocess_upload(_event(path={"job_id": job_id}))
+    new_id = json.loads(resp["body"])["job_id"]
+    assert resp["statusCode"] == 201 and new_id != job_id
+    assert conn.execute("SELECT allow_duplicate, status FROM upload_jobs WHERE id = %s", (new_id,)).fetchone() == (True, "PENDING")
+    assert s3.get_object(Bucket=BUCKET, Key=f"uploads/{new_id}.csv")["Body"].read() == b"user_id\n"
+
+    assert api.reprocess_upload(_event(path={"job_id": "bad"}))["statusCode"] == 400
+    assert api.reprocess_upload(_event(path={"job_id": "0" * 8 + "-0000-0000-0000-" + "0" * 12}))["statusCode"] == 404

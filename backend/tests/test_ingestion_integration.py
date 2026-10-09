@@ -88,3 +88,21 @@ def test_webhook_failure_is_retried_without_reloading(env, monkeypatch):
     assert ingestion.process_upload(conn, BUCKET, key).status == "COMPLETED"  # SQS redelivery
     assert len(sent) == 1
     assert conn.execute("SELECT webhook_delivered_at FROM upload_jobs").fetchone()[0] is not None
+
+
+def test_allow_duplicate_job_is_processed_and_original_stays_the_reference(env):
+    conn, s3, sent = env
+    body = HEADER + _row(1) + _row(2)
+    first = ingestion.process_upload(conn, BUCKET, _upload(conn, s3, body))
+    dup = ingestion.process_upload(conn, BUCKET, _upload(conn, s3, body))
+    assert (first.status, dup.status) == ("COMPLETED", "DUPLICATE")
+
+    key = _upload(conn, s3, body)
+    conn.execute("UPDATE upload_jobs SET allow_duplicate = true WHERE s3_key = %s", (key,))
+    conn.commit()
+    forced = ingestion.process_upload(conn, BUCKET, key)
+    assert forced.status == "COMPLETED" and len(sent) == 2  # matching runs again
+    assert conn.execute("SELECT file_hash FROM upload_jobs WHERE id = %s", (forced.job_id,)).fetchone()[0] is None
+
+    again = ingestion.process_upload(conn, BUCKET, _upload(conn, s3, body))
+    assert again.status == "DUPLICATE"  # a normal re-upload is still caught, against the original

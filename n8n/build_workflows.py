@@ -349,6 +349,11 @@ WITH ins AS (
   SELECT $1, $3, now(), 'ok' WHERE (SELECT count(*) FROM ins) > 0
   ON CONFLICT (source) DO UPDATE SET content_hash = EXCLUDED.content_hash,
     last_crawled_at = now(), last_status = 'ok'
+), failed AS (    -- keep the old hash (so the next run retries) but record why this run stored nothing
+  INSERT INTO crawl_state (source, content_hash, last_crawled_at, last_status)
+  SELECT $1, NULL, now(), left('error: ' || $4::text, 500)
+  WHERE (SELECT count(*) FROM ins) = 0 AND NULLIF($4::text, '') IS NOT NULL
+  ON CONFLICT (source) DO UPDATE SET last_crawled_at = now(), last_status = EXCLUDED.last_status
 )
 SELECT $1 AS source, (SELECT count(*) FROM ins) AS upserted, (SELECT count(*) FROM retired) AS retired
 """.strip()
@@ -376,13 +381,14 @@ def build_discovery():
         "combinator": "and"}, "options": {}})
     code_node(f, "LLM Extract Products", "a_extract_products.js", mode="runOnceForEachItem")
     pg(f, "Upsert Products", UPSERT_PRODUCTS,
-       "={{ [$json.source, JSON.stringify($json.products), $json.content_hash] }}")
+       "={{ [$json.source, JSON.stringify($json.products), $json.content_hash, $json.error || ''] }}")
+    code_node(f, "Report Extraction Errors", "a_report.js")
 
     f.connect("Daily 02:00", "Load Crawl State")
     f.connect("Run Now (manual)", "Load Crawl State")
     f.chain("Load Crawl State", "Sources", "Fetch Page", "Extract Text", "Changed & Readable?")
     f.connect("Changed & Readable?", "LLM Extract Products", 0)
-    f.chain("LLM Extract Products", "Upsert Products")
+    f.chain("LLM Extract Products", "Upsert Products", "Report Extraction Errors")
     f.write()
 
 

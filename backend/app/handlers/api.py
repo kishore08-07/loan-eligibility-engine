@@ -1,6 +1,7 @@
 """HTTP API Lambda handlers (API Gateway HTTP API, payload format 2.0). One function per route."""
 import datetime
 import decimal
+import hmac
 import json
 import re
 import uuid
@@ -8,7 +9,7 @@ import uuid
 from psycopg.rows import dict_row
 
 from app import config, db
-from app.aws import s3_public
+from app.aws import s3, s3_public
 from app.log import get_logger
 
 logger = get_logger("handler.api")
@@ -36,9 +37,19 @@ def _rows(sql: str, params=()) -> list[dict]:
     return rows
 
 
+def _authorised(event) -> bool:
+    """True when no API_KEY is configured, or the request carries it in the x-api-key header."""
+    if not config.API_KEY:
+        return True
+    supplied = (event.get("headers") or {}).get("x-api-key", "")  # HTTP API lower-cases header names
+    return hmac.compare_digest(supplied.encode(), config.API_KEY.encode())
+
+
 def _guard(fn):
-    """Turn unexpected errors into a 500 without leaking details; drop a broken connection."""
+    """Check the API key, and turn unexpected errors into a 500 without leaking details."""
     def wrapper(event, context=None):
+        if fn.__name__ != "health" and not _authorised(event):
+            return _resp(401, {"error": "unauthorized"})
         try:
             return fn(event, context)
         except Exception:
@@ -113,6 +124,39 @@ def get_upload(event, context=None):
         "matching_status", "created_at", "finished_at")},
         "matches": counts["matches"], "notified": counts["notified"],
         "funnel": funnel[0] if funnel else None, "error_report_url": error_url})
+
+
+@_guard
+def reprocess_upload(event, context=None):
+    """"Process anyway": run the full pipeline again for a file that was rejected as a DUPLICATE.
+
+    Creates a new job and copies the stored object to its key; the S3 event then drives the normal
+    ingest path (with the duplicate check switched off for that job).
+    """
+    job_id = _job_id(event)
+    if not job_id:
+        return _resp(400, {"error": "invalid job id"})
+    jobs = _rows("SELECT filename, status, s3_key FROM upload_jobs WHERE id = %s", (job_id,))
+    if not jobs:
+        return _resp(404, {"error": "not found"})
+    if jobs[0]["status"] != "DUPLICATE":
+        return _resp(409, {"error": "only a DUPLICATE upload can be processed again"})
+
+    new_id = str(uuid.uuid4())
+    key = f"uploads/{new_id}.csv"
+    conn = db.get_conn()
+    conn.execute("INSERT INTO upload_jobs (id, filename, s3_key, allow_duplicate) VALUES (%s, %s, %s, true)",
+                 (new_id, jobs[0]["filename"], key))
+    conn.commit()
+    try:
+        s3().copy_object(Bucket=config.UPLOAD_BUCKET, Key=key,
+                         CopySource={"Bucket": config.UPLOAD_BUCKET, "Key": jobs[0]["s3_key"]})
+    except Exception:
+        conn.execute("UPDATE upload_jobs SET status = 'FAILED', error_message = 'could not copy the original file', "
+                     "finished_at = now(), updated_at = now() WHERE id = %s", (new_id,))
+        conn.commit()
+        raise
+    return _resp(201, {"job_id": new_id, "reprocessing": job_id})
 
 
 @_guard
